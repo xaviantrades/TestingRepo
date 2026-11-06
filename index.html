@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TV Price Label Overlay Test</title>
+<style>
+  :root{--bg:#0b0e11;--panel:#161a1f;--fg:#e6e8ea;--mut:#8a929b;--g:#26a69a;--r:#ef5350;--acc:#2962ff}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+  body{display:flex;flex-direction:column}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px;background:var(--panel)}
+  button{background:#232a31;color:var(--fg);border:0;border-radius:6px;padding:9px 12px;font-weight:600}
+  button.buy{background:var(--g)} button.sell{background:var(--r)} button.go{background:var(--acc)}
+  label{color:var(--mut);font-size:12px;display:flex;gap:6px;align-items:center}
+  input[type=range]{width:90px}
+  #stage{position:relative;flex:1;min-height:300px}
+  iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+  canvas#ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  #status{font-size:12px;color:var(--mut);padding:4px 8px;background:var(--panel)}
+</style>
+</head>
+<body>
+<div class="bar">
+  <button class="go" id="start">1. Start tracking</button>
+  <button class="buy" id="buy">BUY</button>
+  <button class="sell" id="sell">SELL</button>
+  <button id="clear">Clear</button>
+  <label>Axis px <input type="range" id="axisW" min="40" max="120" value="70"></label>
+  <label>Label h <input type="range" id="labelH" min="14" max="40" value="22"></label>
+  <label><input type="checkbox" id="dbg" checked> debug</label>
+  <label>Manual Y <input type="range" id="man" min="0" max="100" value="50"></label>
+</div>
+<div id="status">Idle. Click “Start tracking”, choose “This Tab” (Chrome/Edge).</div>
+<div id="stage">
+  <iframe id="tv" allow="fullscreen"
+    src="https://s.tradingview.com/widgetembed/?frameElementId=tv&symbol=FX%3AGBPUSD&interval=5&theme=dark&style=1&hidesidetoolbar=0&locale=en"></iframe>
+  <canvas id="ov"></canvas>
+</div>
+<video id="vid" muted playsinline style="display:none"></video>
+
+<script>
+const $ = id => document.getElementById(id);
+const stage = $('stage'), ov = $('ov'), ctx = ov.getContext('2d');
+const vid = $('vid'), work = document.createElement('canvas'), wctx = work.getContext('2d', {willReadFrequently:true});
+let tracking = false, cropped = false, order = null;
+let live = null;               // {y, color} smoothed, css px relative to stage
+let manual = false;
+
+function fit(){
+  const r = stage.getBoundingClientRect(), d = devicePixelRatio || 1;
+  ov.width = r.width*d; ov.height = r.height*d;
+  ctx.setTransform(d,0,0,d,0,0);
+}
+addEventListener('resize', fit); fit();
+
+const isGreen = (r,g,b) => g>130 && r<100 && b>90 && b<200 && g>r+50;
+const isRed   = (r,g,b) => r>200 && g<120 && b<120;
+
+/* ---------- start capture ---------- */
+$('start').onclick = async () => {
+  try{
+    const s = await navigator.mediaDevices.getDisplayMedia({video:{frameRate:15}, preferCurrentTab:true, selfBrowserSurface:'include'});
+    const track = s.getVideoTracks()[0];
+    cropped = false;
+    try{ // Region Capture: frame == stage only
+      if(window.CropTarget && track.cropTo){
+        const ct = await CropTarget.fromElement(stage);
+        await track.cropTo(ct); cropped = true;
+      }
+    }catch(e){ console.warn('cropTo failed', e); }
+    vid.srcObject = s; await vid.play();
+    tracking = true; manual = false;
+    track.onended = () => { tracking = false; status('Capture stopped.'); };
+    status('Tracking. ' + (cropped ? 'Region capture ON.' : 'Full-tab capture (no crop).'));
+    loop();
+  }catch(e){ status('Capture failed: ' + e.message + ' (use https/localhost, Chrome/Edge)'); }
+};
+
+/* ---------- detection ---------- */
+function detect(){
+  const rect = stage.getBoundingClientRect();
+  const W = Math.round(rect.width), H = Math.round(rect.height);
+  const axisW = +$('axisW').value, labelH = +$('labelH').value;
+  const vw = vid.videoWidth, vh = vid.videoHeight; if(!vw) return null;
+  // map css px -> video px
+  const sc = cropped ? vw / rect.width : vw / innerWidth;
+  const ox = cropped ? 0 : rect.left*sc, oy = cropped ? 0 : rect.top*sc;
+  const x0 = W - axisW - 4;                      // leave small right margin for scrollbars
+  work.width = axisW; work.height = H;
+  wctx.drawImage(vid, ox + x0*sc, oy, axisW*sc, H*sc, 0, 0, axisW, H);
+  const px = wctx.getImageData(0,0,axisW,H).data;
+
+  const runs = []; let cur = null;
+  for(let y=0;y<H;y++){
+    let g=0,r=0;
+    for(let x=0;x<axisW;x++){
+      const i=(y*axisW+x)*4, R=px[i],G=px[i+1],B=px[i+2];
+      if(isGreen(R,G,B)) g++; else if(isRed(R,G,B)) r++;
+    }
+    const col = g/axisW>0.55 ? 'g' : r/axisW>0.55 ? 'r' : null;
+    if(col && cur && cur.col===col) cur.end=y;
+    else{ if(cur) runs.push(cur); cur = col ? {col,start:y,end:y} : null; }
+  }
+  if(cur) runs.push(cur);
+  const good = runs.filter(r => r.end-r.start+1 >= 10);
+  if(!good.length) return null;
+  const run = good[0];                           // topmost = price tag (countdown tag sits below)
+  const h = Math.min(run.end-run.start+1, labelH);
+  return {y: run.start + h/2, h, color: run.col==='g' ? '#26a69a' : '#ef5350', x0, axisW, W};
+}
+
+/* ---------- loop ---------- */
+let lastT = 0;
+function loop(t=0){
+  if(!tracking) return;
+  requestAnimationFrame(loop);
+  if(t - lastT < 66) return; lastT = t;          // ~15 fps scan
+  const d = detect();
+  if(d){
+    live = live ? {...d, y: live.y + (d.y-live.y)*0.6} : d;   // light smoothing
+    $('status').textContent = `Label y=${d.y.toFixed(1)}px  colour=${d.color==='#26a69a'?'green':'red'}  ${cropped?'(region)':'(full tab)'}`;
+  } else status('Price label not found (is it visible / axis width right?)');
+  draw();
+}
+
+/* ---------- manual test mode (no capture needed) ---------- */
+$('man').oninput = () => {
+  if(tracking) return;
+  manual = true;
+  const H = stage.clientHeight, W = stage.clientWidth;
+  live = {y: H*(+$('man').value/100), h:+$('labelH').value, color:'#26a69a', x0:W-+$('axisW').value-4, axisW:+$('axisW').value, W};
+  draw();
+};
+
+/* ---------- drawing ---------- */
+function draw(){
+  const W = stage.clientWidth, H = stage.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  if(!live) return;
+  if($('dbg').checked){
+    ctx.strokeStyle='#ffeb3b'; ctx.lineWidth=1; ctx.setLineDash([]);
+    ctx.strokeRect(live.x0+.5, live.y-live.h/2, live.axisW, live.h);
+  }
+  if(!order) return;
+  const col = order.side==='BUY' ? '#26a69a' : '#ef5350';
+  const y = live.y;
+  // dashed line from left edge to axis
+  ctx.setLineDash([6,4]); ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(live.x0,y); ctx.stroke(); ctx.setLineDash([]);
+  // ring around label
+  ctx.lineWidth = 3; ctx.strokeStyle = '#fff';
+  ctx.beginPath(); ctx.roundRect(live.x0-3, y-live.h/2-4, live.axisW+6, live.h+8, 8); ctx.stroke();
+  // order tag
+  const txt = `${order.side} ${order.size}`;
+  ctx.font = '700 12px system-ui'; const tw = ctx.measureText(txt).width + 18;
+  ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(live.x0-tw-10, y-12, tw, 24, 6); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.textBaseline='middle'; ctx.fillText(txt, live.x0-tw-1, y+1);
+  // arrow
+  ctx.fillStyle = col; ctx.beginPath();
+  ctx.moveTo(live.x0-6,y); ctx.lineTo(live.x0-14,y-6); ctx.lineTo(live.x0-14,y+6); ctx.fill();
+}
+// redraw when manual mode and no tracking
+function tick(){ if(!tracking) draw(); requestAnimationFrame(tick); } tick();
+
+$('buy').onclick  = () => { order = {side:'BUY', size:'0.10'}; draw(); };
+$('sell').onclick = () => { order = {side:'SELL', size:'0.10'}; draw(); };
+$('clear').onclick= () => { order = null; draw(); };
+function status(m){ $('status').textContent = m; }
+</script>
+</body>
+</html>
